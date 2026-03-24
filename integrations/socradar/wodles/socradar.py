@@ -21,7 +21,7 @@ Pagination Logic:
     4. Emit in that order → oldest first, newest last
 
 Author: SOCRadar Integration Team
-Version: 1.0.0
+Version: 1.0.1
 """
 
 import json
@@ -189,46 +189,117 @@ def build_ssl_context(config):
     return ctx
 
 
-def api_request(url, headers):
-    req = urllib.request.Request(url, headers=headers, method="GET")
+def _get_int(config, key, default=None, min_value=None, max_value=None):
+    if not isinstance(config, dict):
+        return default
+    value = config.get(key)
+    if value is None or value == "":
+        return default
     try:
-        start = time.time()
-        open_kwargs = {"timeout": 120}
-        if SSL_CTX is not None:
-            open_kwargs["context"] = SSL_CTX
-        with urllib.request.urlopen(req, **open_kwargs) as resp:
-            status = getattr(resp, "status", None) or resp.getcode()
-            raw = resp.read()
-            elapsed_ms = int((time.time() - start) * 1000)
+        num = int(value)
+    except Exception:
+        return default
+    if min_value is not None and num < min_value:
+        num = min_value
+    if max_value is not None and num > max_value:
+        num = max_value
+    return num
 
-            if _should_log("DEBUG"):
-                safe_resp_headers = _safe_headers_for_log(getattr(resp, "headers", None))
-                log("DEBUG", f"HTTP {status} {elapsed_ms}ms | {url} | headers={safe_resp_headers} | bytes={len(raw)}")
 
-            try:
-                return json.loads(raw.decode())
-            except Exception as e:
-                snippet = ""
-                try:
-                    snippet = _truncate(raw.decode(errors="replace"), 2000)
-                except Exception:
-                    snippet = "<non-text response>"
-                log("ERROR", f"Failed to parse JSON from {url}: {e} | body={snippet}")
-                return None
-    except urllib.error.HTTPError as e:
-        err_body = ""
+def _get_float(config, key, default=None, min_value=None, max_value=None):
+    if not isinstance(config, dict):
+        return default
+    value = config.get(key)
+    if value is None or value == "":
+        return default
+    try:
+        num = float(value)
+    except Exception:
+        return default
+    if min_value is not None and num < min_value:
+        num = min_value
+    if max_value is not None and num > max_value:
+        num = max_value
+    return num
+
+
+def _should_retry_http_status(code):
+    # Common transient errors / Cloudflare upstream timeouts.
+    return code in (408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524)
+
+
+def api_request(url, headers, config=None):
+    """Perform a GET request and parse JSON.
+
+    Retries are intentionally conservative and configurable. The main resiliency
+    mechanism is the persistent retry queue in the state file.
+    """
+    http_retries = _get_int(config, "http_retries", default=0, min_value=0, max_value=5)
+    timeout_seconds = _get_int(config, "http_timeout_seconds", default=120, min_value=5, max_value=600)
+
+    attempts = 0
+    max_attempts = 1 + http_retries
+    req = urllib.request.Request(url, headers=headers, method="GET")
+
+    while True:
+        attempts += 1
         try:
-            err_body = e.read().decode(errors="replace") if e.fp else ""
-        except Exception:
+            start = time.time()
+            open_kwargs = {"timeout": timeout_seconds}
+            if SSL_CTX is not None:
+                open_kwargs["context"] = SSL_CTX
+            with urllib.request.urlopen(req, **open_kwargs) as resp:
+                status = getattr(resp, "status", None) or resp.getcode()
+                raw = resp.read()
+                elapsed_ms = int((time.time() - start) * 1000)
+
+                if _should_log("DEBUG"):
+                    safe_resp_headers = _safe_headers_for_log(getattr(resp, "headers", None))
+                    log("DEBUG", f"HTTP {status} {elapsed_ms}ms | {url} | headers={safe_resp_headers} | bytes={len(raw)}")
+
+                try:
+                    return json.loads(raw.decode())
+                except Exception as e:
+                    snippet = ""
+                    try:
+                        snippet = _truncate(raw.decode(errors="replace"), 2000)
+                    except Exception:
+                        snippet = "<non-text response>"
+                    log("ERROR", f"Failed to parse JSON from {url}: {e} | body={snippet}")
+                    return None
+        except urllib.error.HTTPError as e:
+            code = getattr(e, "code", None)
             err_body = ""
-        extra = ""
-        if _should_log("DEBUG"):
-            extra = f" | headers={_safe_headers_for_log(getattr(e, 'headers', None))}"
-        log("ERROR", f"HTTP {e.code} from {url}: {_truncate(err_body, 2000)}{extra}")
-        return None
-    except Exception as e:
-        log("ERROR", f"Request failed: {e} | url={url}")
-        return None
+            try:
+                err_body = e.read().decode(errors="replace") if e.fp else ""
+            except Exception:
+                err_body = ""
+            extra = ""
+            if _should_log("DEBUG"):
+                extra = f" | headers={_safe_headers_for_log(getattr(e, 'headers', None))}"
+
+            if code and _should_retry_http_status(code) and attempts < max_attempts:
+                retry_after = 0
+                try:
+                    retry_after = int(getattr(e, "headers", {}).get("Retry-After") or 0)
+                except Exception:
+                    retry_after = 0
+                sleep_s = retry_after if retry_after > 0 else min(10, 2 ** (attempts - 1))
+                log("WARN", f"HTTP {code} (attempt {attempts}/{max_attempts}) | retrying in {sleep_s}s | url={url}")
+                time.sleep(sleep_s)
+                continue
+
+            log("ERROR", f"HTTP {code} from {url}: {_truncate(err_body, 2000)}{extra}")
+            return None
+        except Exception as e:
+            # Covers timeouts/URLError/ssl errors.
+            if attempts < max_attempts:
+                sleep_s = min(10, 2 ** (attempts - 1))
+                log("WARN", f"Request failed (attempt {attempts}/{max_attempts}) | retrying in {sleep_s}s | err={e} | url={url}")
+                time.sleep(sleep_s)
+                continue
+            log("ERROR", f"Request failed: {e} | url={url}")
+            return None
 
 
 def parse_args(argv):
@@ -346,6 +417,224 @@ def _extract_list_and_total(result):
     return [], total_records
 
 
+def _params_fingerprint(config):
+    """Fingerprint parts of config that affect API query params (excluding api_key)."""
+    if not isinstance(config, dict):
+        return ""
+    try:
+        data = {
+            "company_id": config.get("company_id"),
+            "fetch_status": config.get("fetch_status"),
+            "min_severity": config.get("min_severity"),
+            "alarm_main_types": config.get("alarm_main_types", []),
+        }
+        return json.dumps(data, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        return ""
+
+
+def _page_key(start_epoch, end_epoch, page, page_size, include_total, fingerprint):
+    try:
+        return f"{int(start_epoch)}:{int(end_epoch)}:{int(page)}:{int(page_size)}:{'t' if include_total else 'f'}:{fingerprint}"
+    except Exception:
+        return f"{start_epoch}:{end_epoch}:{page}:{page_size}:{include_total}:{fingerprint}"
+
+
+def _get_retry_pages(state):
+    if not isinstance(state, dict):
+        return []
+    q = state.get("retry_pages")
+    if isinstance(q, list):
+        return q
+    return []
+
+
+def _set_retry_pages(state, pages):
+    if isinstance(state, dict):
+        state["retry_pages"] = pages if isinstance(pages, list) else []
+
+
+def _prune_retry_pages(state, max_retry_pages):
+    if not isinstance(state, dict):
+        return
+    q = _get_retry_pages(state)
+    if max_retry_pages is not None and int(max_retry_pages) <= 0:
+        _set_retry_pages(state, [])
+        return
+    if len(q) <= max_retry_pages:
+        _set_retry_pages(state, q)
+        return
+
+    def _created(w):
+        if isinstance(w, dict):
+            return int(w.get("created_epoch") or 0)
+        return 0
+
+    q_sorted = sorted([w for w in q if isinstance(w, dict)], key=_created)
+    _set_retry_pages(state, q_sorted[-max_retry_pages:])
+
+
+def enqueue_retry_page(state, start_epoch, end_epoch, page, page_size, include_total=False, reason=None, fingerprint=None):
+    if not isinstance(state, dict):
+        return
+    try:
+        start_epoch = int(start_epoch)
+        end_epoch = int(end_epoch)
+        page = int(page)
+        page_size = int(page_size)
+    except Exception:
+        return
+
+    if start_epoch <= 0 or end_epoch <= 0 or start_epoch >= end_epoch:
+        return
+    if page < 1 or page_size < 1:
+        return
+
+    fingerprint = fingerprint or ""
+    key = _page_key(start_epoch, end_epoch, page, page_size, include_total, fingerprint)
+    now = now_epoch()
+
+    q = _get_retry_pages(state)
+    for t in q:
+        if isinstance(t, dict) and t.get("key") == key:
+            t["last_error"] = str(reason) if reason else t.get("last_error")
+            t["last_enqueued_epoch"] = now
+            return
+
+    q.append(
+        {
+            "key": key,
+            "start_epoch": start_epoch,
+            "end_epoch": end_epoch,
+            "page": page,
+            "page_size": page_size,
+            "include_total": bool(include_total),
+            "fingerprint": fingerprint,
+            "attempts": 0,
+            "next_retry_epoch": 0,
+            "created_epoch": now,
+            "last_error": str(reason) if reason else None,
+            "last_attempt_epoch": None,
+            "last_success_epoch": None,
+            "last_enqueued_epoch": now,
+        }
+    )
+    _set_retry_pages(state, q)
+
+
+def _due_retry_pages(state, max_per_run):
+    q = _get_retry_pages(state)
+    if not q:
+        return []
+
+    now = now_epoch()
+
+    def _next(w):
+        if isinstance(w, dict):
+            try:
+                return int(w.get("next_retry_epoch") or 0)
+            except Exception:
+                return 0
+        return 0
+
+    due = []
+    for t in sorted([w for w in q if isinstance(w, dict)], key=_next):
+        if len(due) >= max_per_run:
+            break
+        if _next(t) <= now:
+            due.append(t)
+    return due
+
+
+def _mark_retry_page_attempt(task, config, failure_reason=None):
+    if not isinstance(task, dict):
+        return
+    now = now_epoch()
+    task["attempts"] = int(task.get("attempts") or 0) + 1
+    task["last_attempt_epoch"] = now
+    if failure_reason:
+        task["last_error"] = str(failure_reason)
+
+    base = _get_int(config, "retry_backoff_seconds", default=60, min_value=5, max_value=3600)
+    max_b = _get_int(config, "retry_backoff_max_seconds", default=3600, min_value=60, max_value=86400)
+    exp = min(10, int(task["attempts"]))
+    delay = min(max_b, base * (2 ** (exp - 1)))
+    task["next_retry_epoch"] = now + delay
+
+
+def _mark_retry_page_success(task):
+    if not isinstance(task, dict):
+        return
+    now = now_epoch()
+    task["last_success_epoch"] = now
+    task["next_retry_epoch"] = 0
+
+
+def _remove_retry_page(state, key):
+    if not isinstance(state, dict):
+        return
+    q = _get_retry_pages(state)
+    _set_retry_pages(state, [t for t in q if not (isinstance(t, dict) and t.get("key") == key)])
+
+
+def _try_migrate_retry_windows_to_pages(state, config):
+    """Best-effort migration for older 'retry_windows' entries.
+
+    If a window's last_error contains 'failed_pages=[...]', enqueue those pages.
+    Otherwise, keep the old window entry untouched.
+    """
+    if not isinstance(state, dict):
+        return
+
+    old = state.get("retry_windows")
+    if not isinstance(old, list) or not old:
+        return
+
+    page_size = get_page_size(config) if isinstance(config, dict) else DEFAULT_PAGE_SIZE
+    fingerprint = _params_fingerprint(config)
+    migrated_any = False
+    remaining_windows = []
+
+    for w in old:
+        if not isinstance(w, dict):
+            continue
+        w_start = w.get("start_epoch")
+        w_end = w.get("end_epoch")
+        last_error = str(w.get("last_error") or "")
+
+        failed_pages = None
+        if "failed_pages=" in last_error:
+            try:
+                # expects something like "failed_pages=[4, 2]"
+                part = last_error.split("failed_pages=", 1)[1].strip()
+                if part.startswith("[") and "]" in part:
+                    inside = part.split("]", 1)[0].lstrip("[")
+                    nums = []
+                    for token in inside.split(","):
+                        token = token.strip()
+                        if token:
+                            nums.append(int(token))
+                    failed_pages = nums
+            except Exception:
+                failed_pages = None
+
+        if failed_pages:
+            for p in failed_pages:
+                enqueue_retry_page(state, w_start, w_end, page=p, page_size=page_size, include_total=False, reason=last_error, fingerprint=fingerprint)
+            migrated_any = True
+            continue
+
+        if "initial_call_failed" in last_error:
+            enqueue_retry_page(state, w_start, w_end, page=1, page_size=page_size, include_total=True, reason=last_error, fingerprint=fingerprint)
+            migrated_any = True
+            continue
+
+        remaining_windows.append(w)
+
+    if migrated_any:
+        state["retry_windows"] = remaining_windows
+
+
 # ---------------------------------------------------------------------------
 # SOCRadar API v4 — Full Reverse Pagination
 # ---------------------------------------------------------------------------
@@ -358,9 +647,7 @@ def build_url(config, start_epoch, end_epoch, page, page_size, include_total=Fal
         "page": page,
         "limit": page_size,
         "start_date": start_epoch,
-        "end_date": end_epoch,
-        "include_alarm_details": "true",
-        "include_ai_insight": "true",
+        "end_date": end_epoch
     }
 
     if include_total:
@@ -388,10 +675,10 @@ def fetch_page(config, start_epoch, end_epoch, page, page_size, include_total=Fa
         "Accept": "application/json",
         "User-Agent": USER_AGENT,
     }
-    return api_request(url, headers)
+    return api_request(url, headers, config=config)
 
 
-def fetch_all_incidents(config, start_epoch, end_epoch):
+def fetch_all_incidents(config, start_epoch, end_epoch, sleep_seconds=0.2):
     """
     Full reverse pagination for chronological order:
 
@@ -420,17 +707,19 @@ def fetch_all_incidents(config, start_epoch, end_epoch):
         log("DEBUG", f"Fetch settings: {debug_filters}")
 
     # Step 1: Get total count from first request
+    failed_pages = []
     result = fetch_page(config, start_epoch, end_epoch, page=1, page_size=page_size, include_total=True)
 
     if not result or not result.get("is_success", False):
         log("ERROR", f"Initial call failed: {result}")
-        return []
+        failed_pages.append({"page": 1, "include_total": True})
+        return [], True, "initial_call_failed", failed_pages
 
     first_page_data, total_records = _extract_list_and_total(result)
 
     if total_records == 0 and not first_page_data:
         log("INFO", "No incidents in time range")
-        return []
+        return [], False, None, []
 
     if total_records == 0:
         total_records = len(first_page_data)
@@ -445,7 +734,7 @@ def fetch_all_incidents(config, start_epoch, end_epoch):
 
     # Single page — reverse and return
     if total_pages <= 1:
-        return list(reversed(first_page_data))
+        return list(reversed(first_page_data)), False, None, []
 
     # Step 2: Fetch from LAST page to page 2 (we already have page 1)
     all_pages = {1: first_page_data}
@@ -456,14 +745,15 @@ def fetch_all_incidents(config, start_epoch, end_epoch):
 
         if not page_result or not page_result.get("is_success", False):
             log("ERROR", f"Failed page {page_num}")
-            continue
+            failed_pages.append({"page": page_num, "include_total": False})
+        else:
+            page_data, _ = _extract_list_and_total(page_result)
 
-        page_data, _ = _extract_list_and_total(page_result)
+            if page_data:
+                all_pages[page_num] = page_data
 
-        if page_data:
-            all_pages[page_num] = page_data
-
-        time.sleep(0.2)
+        if sleep_seconds and sleep_seconds > 0:
+            time.sleep(sleep_seconds)
 
     # Step 3: Assemble chronologically (last page first → first page last)
     all_incidents = []
@@ -472,7 +762,11 @@ def fetch_all_incidents(config, start_epoch, end_epoch):
             all_incidents.extend(reversed(all_pages[page_num]))
 
     log("INFO", f"Collected {len(all_incidents)} incidents (chronological)")
-    return all_incidents
+    had_failures = len(failed_pages) > 0
+    err_summary = None
+    if had_failures:
+        err_summary = f"failed_pages={[f.get('page') for f in failed_pages if isinstance(f, dict)]}"
+    return all_incidents, had_failures, err_summary, failed_pages
 
 
 # ---------------------------------------------------------------------------
@@ -572,6 +866,7 @@ def main():
     end_epoch = now_epoch()
 
     last_run_epoch = state.get("last_run_epoch")
+    is_first_run = not bool(last_run_epoch)
     if last_run_epoch:
         start_epoch = last_run_epoch
     else:
@@ -584,12 +879,122 @@ def main():
         f"{datetime.fromtimestamp(start_epoch, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} -> "
         f"{datetime.fromtimestamp(end_epoch, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # Fetch all incidents (reverse pagination, chronological output)
-    incidents = fetch_all_incidents(config, start_epoch, end_epoch)
-
     # Deduplicate against seen alarm IDs
     seen = set(state.get("seen_alarm_ids", []))
     new_count = 0
+    total_fetched = 0
+
+    # Retry queue settings (support older key names as fallback)
+    max_retry_pages = _get_int(
+        config,
+        "max_retry_pages",
+        default=_get_int(config, "max_retry_windows", default=25, min_value=0, max_value=200),
+        min_value=0,
+        max_value=200,
+    )
+    max_retry_pages_per_run = _get_int(
+        config,
+        "max_retry_pages_per_run",
+        default=_get_int(config, "max_retry_windows_per_run", default=1, min_value=0, max_value=20),
+        min_value=0,
+        max_value=50,
+    )
+
+    page_sleep_seconds = _get_float(config, "page_sleep_seconds", default=2, min_value=0.0, max_value=10.0)
+    lookback_page_sleep_seconds = _get_float(
+        config,
+        "lookback_page_sleep_seconds",
+        default=page_sleep_seconds,
+        min_value=0.0,
+        max_value=10.0,
+    )
+
+    _try_migrate_retry_windows_to_pages(state, config)
+    _prune_retry_pages(state, max_retry_pages=max_retry_pages)
+
+    # 1) Retry queued failed pages first (bounded), to heal gaps cheaply.
+    for t in _due_retry_pages(state, max_per_run=max_retry_pages_per_run):
+        t_key = t.get("key")
+        t_start = t.get("start_epoch")
+        t_end = t.get("end_epoch")
+        t_page = t.get("page")
+        t_page_size = t.get("page_size")
+        t_include_total = bool(t.get("include_total"))
+        log("INFO", f"Retry page {t_page} | key={t_key}")
+
+        page_result = fetch_page(config, t_start, t_end, page=t_page, page_size=t_page_size, include_total=t_include_total)
+        if not page_result or not page_result.get("is_success", False):
+            _mark_retry_page_attempt(t, config=config, failure_reason="retry_page_failed")
+            log("WARN", f"Retry page still failing | key={t_key} | next_retry_epoch={t.get('next_retry_epoch')}")
+            continue
+
+        page_data, total_records = _extract_list_and_total(page_result)
+        # Emit oldest-first within this page.
+        for incident in reversed(page_data or []):
+            if not isinstance(incident, dict):
+                continue
+            alarm_id = incident.get("alarm_id")
+            if alarm_id is not None and alarm_id not in seen:
+                emit_alert(incident)
+                seen.add(alarm_id)
+                new_count += 1
+        total_fetched += len(page_data or [])
+
+        # If this was the initial include_total request (page 1), expand into per-page
+        # tasks so we can backfill the whole window incrementally without a single
+        # long run.
+        if t_include_total:
+            if total_records == 0:
+                total_records = len(page_data or [])
+            total_pages = 1
+            try:
+                total_pages = int(math.ceil(float(total_records) / float(t_page_size or 1)))
+            except Exception:
+                total_pages = 1
+
+            max_pages = get_max_pages(config)
+            if max_pages and total_pages > max_pages:
+                total_pages = max_pages
+
+            fingerprint = t.get("fingerprint") or _params_fingerprint(config)
+            # Enqueue older pages first (highest page number is oldest).
+            for page_num in range(total_pages, 1, -1):
+                enqueue_retry_page(
+                    state,
+                    t_start,
+                    t_end,
+                    page=page_num,
+                    page_size=t_page_size,
+                    include_total=False,
+                    reason="expanded_from_include_total",
+                    fingerprint=fingerprint,
+                )
+            _prune_retry_pages(state, max_retry_pages=max_retry_pages)
+
+        _mark_retry_page_success(t)
+        _remove_retry_page(state, key=t_key)
+
+    # 2) Normal fetch window for this run (keeps workflow moving)
+    sleep_s = lookback_page_sleep_seconds if is_first_run else page_sleep_seconds
+    incidents, had_failures, err_summary, failed_pages = fetch_all_incidents(config, start_epoch, end_epoch, sleep_seconds=sleep_s)
+    total_fetched += len(incidents)
+    if had_failures:
+        fingerprint = _params_fingerprint(config)
+        page_size = get_page_size(config)
+        for fp in failed_pages:
+            if not isinstance(fp, dict):
+                continue
+            enqueue_retry_page(
+                state,
+                start_epoch,
+                end_epoch,
+                page=fp.get("page"),
+                page_size=page_size,
+                include_total=bool(fp.get("include_total")),
+                reason=err_summary,
+                fingerprint=fingerprint,
+            )
+        _prune_retry_pages(state, max_retry_pages=max_retry_pages)
 
     for incident in incidents:
         if not isinstance(incident, dict):
@@ -619,10 +1024,11 @@ def main():
     state["last_run_epoch"] = end_epoch
     state["last_run_iso"] = datetime.fromtimestamp(end_epoch, tz=timezone.utc).isoformat()
     state["last_fetch_new"] = new_count
-    state["last_fetch_total"] = len(incidents)
+    state["last_fetch_total"] = total_fetched
     save_state(state)
 
-    log("INFO", f"Done | New: {new_count}, Total: {len(incidents)}, Cache: {len(seen_list)}")
+    q_len = len(_get_retry_pages(state))
+    log("INFO", f"Done | New: {new_count}, Total: {total_fetched}, Cache: {len(seen_list)}, RetryQueue: {q_len}")
 
 
 if __name__ == "__main__":
