@@ -41,8 +41,8 @@ account via Disable-ADAccount. Mean Time to Remediate: hours to under 2 seconds.
 - RSAT (Remote Server Administration Tools) installed on the Domain Controller
 - PowerShell execution policy allowing script execution on the Domain Controller
 - Kerberos Service Ticket Operations auditing enabled via Group Policy:
-    Computer Configuration > Advanced Audit Policy Configuration > Account Logon
-    > Audit Kerberos Service Ticket Operations: Success and Failure
+  Computer Configuration > Advanced Audit Policy Configuration > Account Logon
+  > Audit Kerberos Service Ticket Operations: Success and Failure
 - At least one SPN-registered service account present in the domain
 
 ---
@@ -84,17 +84,17 @@ Copy kerb-block.ps1 to the Active Response bin directory on the Domain Controlle
 
 Add the following configuration to ossec.conf on the Wazuh Manager:
 
-    <command>
-      <name>win-disable-user</name>
-      <executable>kerb-block.ps1</executable>
-      <timeout_allowed>no</timeout_allowed>
-    </command>
+    
+      win-disable-user
+      kerb-block.ps1
+      no
+    
 
-    <active-response>
-      <command>win-disable-user</command>
-      <location>local</location>
-      <rules_id>100002</rules_id>
-    </active-response>
+    
+      win-disable-user
+      local
+      100002
+    
 
 Restart Wazuh Manager after configuration changes:
 
@@ -112,8 +112,8 @@ Restart Wazuh Manager after configuration changes:
 4. Wazuh Agent forwards telemetry to Wazuh Manager.
 5. Rule 100002 matches EventID 4769 with EncryptionType 0x17 and fires at Level 12.
 6. Wazuh Active Response triggers kerb-block.ps1 via stdin on the Domain Controller.
-7. Script parses alert JSON, calls Disable-ADAccount, writes timestamped entry
-   to C:\Security\SOAR.log.
+7. Script checks the command field, extracts the target account, calls
+   Disable-ADAccount, and writes a timestamped entry to C:\Security\SOAR.log.
 
 ---
 

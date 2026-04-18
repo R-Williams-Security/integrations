@@ -3,7 +3,7 @@
 
 $logPath = "C:\Security\SOAR.log"
 
-# Ensure log directory exists
+# Ensure log directory exists before any writes
 if (-not (Test-Path "C:\Security")) {
     New-Item -ItemType Directory -Path "C:\Security" -Force | Out-Null
 }
@@ -15,18 +15,32 @@ try {
 
     if ([string]::IsNullOrWhiteSpace($inputData)) {
         "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - ERROR: No input received from Wazuh" |
-        Out-File -FilePath $logPath -Append
+            Out-File -FilePath $logPath -Append
         exit 1
     }
 
-    # Parse the JSON alert - with error handling for malformed input
+    # Parse the JSON alert with dedicated error handling for malformed input
     try {
         $alert = $inputData | ConvertFrom-Json
     }
     catch {
         "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - ERROR: Failed to parse alert JSON. Raw input: $inputData" |
-        Out-File -FilePath $logPath -Append
+            Out-File -FilePath $logPath -Append
         exit 1
+    }
+
+    # Check the Wazuh active-response command field (add / delete)
+    # Only perform the disable action for the 'add' command
+    $command = $alert.command
+    if ([string]::IsNullOrWhiteSpace($command)) {
+        "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - ERROR: No command field in Wazuh active-response payload" |
+            Out-File -FilePath $logPath -Append
+        exit 1
+    }
+    if ($command -ne 'add') {
+        "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - INFO: Ignoring command '$command' - no account action taken" |
+            Out-File -FilePath $logPath -Append
+        exit 0
     }
 
     # Extract the targeted service account from the alert data
@@ -34,7 +48,7 @@ try {
 
     if ([string]::IsNullOrWhiteSpace($targetAccount)) {
         "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - ERROR: Could not extract target account from alert JSON" |
-        Out-File -FilePath $logPath -Append
+            Out-File -FilePath $logPath -Append
         exit 1
     }
 
@@ -46,12 +60,12 @@ try {
 
     # Write success audit entry to SOAR log
     "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - SUCCESS: Disabled account: $targetAccount" |
-    Out-File -FilePath $logPath -Append
+        Out-File -FilePath $logPath -Append
 
     exit 0
 }
 catch {
     "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - ERROR: $($_.Exception.Message)" |
-    Out-File -FilePath $logPath -Append
+        Out-File -FilePath $logPath -Append
     exit 1
 }
