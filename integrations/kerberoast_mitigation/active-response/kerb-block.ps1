@@ -1,3 +1,11 @@
+###########################################################################
+# WILLIAMS MITIGATION FRAMEWORK (WMF) - Version 1.0
+# Author: R-Williams-Security
+# Official Integration: Wazuh PR #75 (Merged)
+# License: MIT
+# Description: Automated Active Response for Kerberoasting (T1558.003)
+# Dedicated to the Wazuh Open Source Community.
+###########################################################################
 # kerb-block.ps1
 # Wazuh Active Response script - receives alert via stdin, disables the targeted AD account
 
