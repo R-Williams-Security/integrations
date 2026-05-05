@@ -2,7 +2,7 @@
 # WILLIAMS MITIGATION FRAMEWORK (WMF) - Version 1.0
 # Author: R-Williams-Security
 # Official Integration: Wazuh PR #75 (Merged)
-# License: MIT
+# License: GNU AGPLv3
 # Description: Automated Active Response for Kerberoasting (T1558.003)
 # Dedicated to the Wazuh Open Source Community.
 ###########################################################################
